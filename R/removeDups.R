@@ -10,11 +10,12 @@
 #' @param data A data frame containing data from a NEON observational data table [data frame]
 #' @param variables The NEON variables file containing metadata about the data table in question [data frame]
 #' @param table The name of the table. Must match one of the table names in 'variables' [character]
+#' @param ncores The maximum number of cores to use for parallel processing. Defaults to 1. [numeric]
 
 #' @return A modified data frame with resolveable duplicates removed and a flag field added and populated.
 
 #' @details 
-#' Duplicates are identified based on exact matches in the values of the primary key. For records with identical keys, these steps are followed, in order: (1) If records are identical except for NA or empty string values, the non-empty values are kept. (2) If records are identical except for uid, remarks, and/or personnel (xxxxBy) fields, unique values are concatenated within each field, and the merged version is kept. (3) For records that are identical following steps 1 and 2, one record is kept and flagged with duplicateRecordQF=1. (4) Records that can't be resolved by steps 1-3 are flagged with duplicateRecordQF=2. Note that in a set of three or more duplicates, some records may be resolveable and some may not; if two or more records are left after steps 1-3, all remaining records are flagged with duplicateRecordQF=2.
+#' Duplicates are identified based on exact matches in the values of the primary key. For records with identical keys, these steps are followed, in order: (1) If records are identical except for NA or empty string values, the non-empty values are kept. (2) If records are identical except for uid, remarks, and/or personnel (xxxxBy) fields, unique values are concatenated within each field, and the merged version is kept. (3) For records that are identical following steps 1 and 2, one record is kept and flagged with duplicateRecordQF=1. (4) Records that can't be resolved by steps 1-3 are flagged with duplicateRecordQF=2. Note that in a set of three or more duplicates, some records may be resolveable and some may not; if two or more records are left after steps 1-3, all remaining records are flagged with duplicateRecordQF=2. In some limited cases, duplicates can't be unambiguously identified, and these records are flagged with duplicateRecordQF=-1.
 
 #' @examples	
 #' # Resolve and flag duplicates in a test dataset of foliar lignin
@@ -34,7 +35,9 @@
 #   Sarah Elmendorf (2015-08-19)
 ##############################################################################################
 
-removeDups <- function(data, variables, table=NA_character_) {
+removeDups <- function(data, variables, 
+                       table=NA_character_,
+                       ncores=1) {
   
   if(is.na(table)) {
     table <- deparse(substitute(data))
@@ -44,9 +47,38 @@ removeDups <- function(data, variables, table=NA_character_) {
   variables <- as.data.frame(variables, stringsAsFactors=F)
   data <- as.data.frame(data, stringsAsFactors=F)
   
+  # check for enough data to run
+  if(nrow(data)==1) {
+    data$duplicateRecordQF <- 0
+    warning("Only one row of data present. duplicateRecordQF set to 0.")
+    return(data)
+  } else {
+    if(nrow(data)==0) {
+      data$duplicateRecordQF <- numeric()
+      warning("Data table is empty.")
+      return(data)
+    }
+  }
+  
   # check table matching
   if(length(which(variables$table==table))==0) {
     stop(paste("Table name", table, "does not match any table in variables file."))
+  }
+  
+  # exceptions for specific data tables
+  if(table=="brd_countdata") {
+    stop("Duplicates cannot be unambiguously identified in brd_countdata. Multiple birds can be observed separately during the same observation minute, at the same distance.")
+  }
+  if(table=="vst_apparentindividual") {
+    if(min(data$date) <= as.POSIXct("2021-12-31", tz="GMT")) {
+      message("In vst_apparentindividual, tempStemID indicates different stems of a multi-stem individual. This temporary ID was rolled out during the 2019-2021 field seasons. In data collected prior to its implementation, multi-stem individuals cannot be distiguished from duplicates, and are flagged with -1, meaning could not be evaluated.")
+    }
+  }
+  if(table=="mam_pertrapnight") {
+    if(any(grepl(pattern="X", x=data$trapCoordinate)) | 
+       any(grepl(pattern="4", x=data$trapStatus))) {
+      message("In rare situations, duplicates cannot be unambiguously identified in mam_pertrapnight. These cases are (1) when multiple individuals are found in a single trap, and cannot be tagged, and (2) when multiple trap locations are disturbed, indicated by trap coordinates labeled with Xs, and the same capture data are found in each. These two scenarios are flagged with -1, meaning could not be evaluated.")
+    }
   }
   
   # remove fields not published
@@ -61,8 +93,16 @@ removeDups <- function(data, variables, table=NA_character_) {
     dif <- setdiff(varnames, names(data))
     if(length(dif)!=0) {
       if(all(dif %in% variables$fieldName[which(variables$downloadPkg=="expanded" & 
-                                            variables$table==table)])) {
-        stop("Input data appear to be the basic download package. The expanded data package is required for removeDups() to identify all duplicates correctly.")
+                                                variables$table==table)])) {
+        stop(paste("Field names in data do not match variables file.\n",
+                   paste0(setdiff(names(data), varnames), collapse=" "), 
+                   ifelse(length(setdiff(names(data), varnames))>0, 
+                          " are in data and not in variables file;\n",
+                          ""), 
+                   paste0(setdiff(varnames, names(data)), collapse=" "), 
+                   ifelse(length(setdiff(varnames, names(data)))>0,
+                          " are in variables file and not in data. The missing data fields are in the expanded package, suggesting the data file may be from the basic package; if an expanded package exists for a given table, removeDups() can only be used with the expanded package.",
+                          ""), sep=""))
       }
     }
     stop(paste("Field names in data do not match variables file.\n",
@@ -133,111 +173,59 @@ removeDups <- function(data, variables, table=NA_character_) {
     # subset to only the records with duplicate values in the key fields
     data.sub <- data.low[union(which(duplicated(data.low[,key])),
                                         which(duplicated(data.low[,key], fromLast=T))),]
+    data.sub$rowid <- as.numeric(data.sub$rowid)
+    
+    # get subset without duplicate values
+    data.nodups <- data[which(!data$rowid %in% data.sub$rowid),]
     
     # iterate over unique key values
     dup.keys <- cbind(unique(data.sub[,key]))
     message(paste(nrow(dup.keys), "duplicated key values found, representing",
         nrow(data.sub), "non-unique records. Attempting to resolve.", sep=" "))
-    pb <- utils::txtProgressBar(style=3)
-    utils::setTxtProgressBar(pb, 1/nrow(dup.keys))
-    ct <- 0
-    for(i in 1:nrow(dup.keys)) {
-      
-      # check for NA key values
-      if(ncol(dup.keys)==1) {
-        na.check <- dup.keys[i]
-        dup.keyvalue <- dup.keys[i]
-      } else {
-        na.check <- dup.keys[i,]
-        dup.keyvalue <- paste0(dup.keys[i,])
+    
+    # set up parallel cores
+    if(nrow(dup.keys)>=100) {
+      ncores <- min(ncores, parallel::detectCores()-2, na.rm=TRUE)
+    } else {
+      ncores <- 1
+    }
+    cl <- parallel::makeCluster(ncores)
+    suppressWarnings(on.exit(parallel::stopCluster(cl)))
+    
+    # make data frame chunks of one key value each
+    dup.list <- list(nrow(dup.keys))
+    if(ncol(dup.keys)==1) {
+      for(i in 1:nrow(dup.keys)) {
+        dup.list[[i]] <- data.sub[which(data.sub[,key] == dup.keys[i]),]
       }
-      if(all(is.na(na.check))) {
-        data$duplicateRecordQF[which(data$keyvalue %in% dup.keyvalue)] <- -1
-        next
-      }
-      
-      # subset data to one key value
-      if(ncol(dup.keys)==1) {
-        data.dup <- data.sub[which(data.sub[,key] == dup.keys[i]),]
-      } else {
-        data.dup <- data.sub[which(do.call(paste0, data.sub[key]) == 
+    } else {
+      for(i in 1:nrow(dup.keys)) {
+        dup.list[[i]] <- data.sub[which(do.call(paste0, data.sub[key]) == 
                                      do.call(paste0, dup.keys)[i]),]
       }
-      data.dup$rowid <- as.numeric(data.dup$rowid)
-      
-      # assign a QF value of 1 in the original data
-      data$duplicateRecordQF[which(data$keyvalue %in% data.dup$keyvalue)] <- 1
-      
-      # if a field is NA in one duplicate but populated in the other,
-      # copy the value from the populated one into the NA
-      # do it in both the original data and in the subset
-      for(j in 1:nrow(data.dup)) {
-        if(all(!is.na(data.dup[j,]))) {
-          data <- data
-        } else {
-          for(k in 1:nrow(data.dup)) {
-            if(all(data.dup[k,-which(colnames(data.dup) %in% c("uid","rowid"))] == 
-                   data.dup[j,-which(colnames(data.dup) %in% c("uid","rowid"))], na.rm=T)) {
-              data[which(data$rowid==data.dup$rowid[j]),][which(is.na(data.dup[j,]))] <- 
-                data[which(data$rowid==data.dup$rowid[k]),][which(is.na(data.dup[j,]))]
-              data.dup[j,][which(is.na(data.dup[j,]))] <- 
-                data.dup[k,][which(is.na(data.dup[j,]))]
-            } else {
-              data[which(data$rowid==data.dup$rowid[j]),] <- 
-                data[which(data$rowid==data.dup$rowid[j]),]
-            }
-          }
-        }
-      }
-      
-      # if all fields are duplicated besides remarks, personnel, and uid, 
-      # concatenate non-data fields with pipe separators
-      # do it in both the original and the subset
-      not.data <- c("rowid", "uid", colnames(data)[grep("emarks", colnames(data))], 
-                    colnames(data)[grep("edBy", colnames(data))])
-      # if data columns differ, duplicate can't be resolved
-      if(nrow(unique(data.dup[,setdiff(colnames(data.dup), not.data)]))==nrow(data.dup)) {
-        data <- data
-      } else {
-        for(k in not.data[-which(not.data=="rowid")]) {
-          if(length(unique(data.dup[,k]))==1) {
-            next
-          } else {
-            dup.not <- data.dup$rowid[union(which(duplicated(
-              data.dup[,setdiff(colnames(data.dup), not.data)])), 
-              which(duplicated(data.dup[,setdiff(colnames(data.dup), not.data)], 
-                                fromLast=T)))]
-            data[which(data$rowid %in% dup.not),k] <- 
-              paste(unique(data[which(data$rowid %in% dup.not),k]), collapse="|")
-            data.dup[which(data.dup$rowid %in% dup.not),k] <- 
-              paste(unique(data.dup[which(data.dup$rowid %in% dup.not),k]), collapse="|")
-          }
-        }
-      }
-      
-      # delete all but one of the set of duplicate records
-      dup.rows <- data.dup$rowid[which(duplicated(data.dup[,-which(colnames(data.dup)=="rowid")]))]
-      if(length(dup.rows)>0) {
-        data <- data[-which(data$rowid %in% dup.rows),]
-      }
-      ct <- ct + length(dup.rows)
-      utils::setTxtProgressBar(pb, i/nrow(dup.keys))
+    }
+
+    # make data frame chunks of one key value each from the original (mixed case) data
+    data.list <- list(nrow(dup.keys))
+    for(i in 1:nrow(dup.keys)) {
+       data.list[[i]] <- data[which(data$keyvalue %in% dup.list[[i]]$keyvalue),]
     }
     
-    # flag remaining, unresolved duplicates
-    # if some in a group are resolved and some aren't, all end up with QF=2
-    unres.dups <- union(which(duplicated(data$keyvalue)), 
-                        which(duplicated(data$keyvalue, fromLast=T)))
-    if(any(data$duplicateRecordQF==-1)) {
-      unres.dups <- setdiff(unres.dups, which(data$duplicateRecordQF==-1))
-    }
-    data$duplicateRecordQF[unres.dups] <- 2
+    # de-dup each chunk
+    proc.data <- parallel::clusterMap(cl=cl, fun=dupProcess, data=data.list, 
+                                      data.dup=dup.list, table=table)
     
-    utils::setTxtProgressBar(pb, 1)
-    close(pb)
+    # stack chunks and re-order
+    data.d <- data.table::rbindlist(proc.data, fill=TRUE)
+    data <- data.table::rbindlist(list(data.d, data.nodups), fill=TRUE)
+    data <- data[order(data$rowid),]
+    data <- data.frame(data)
+    
+    # calculate de-dup numbers to report to user
+    dupdiff <- sum(unlist(lapply(dup.list, FUN=nrow)) - unlist(lapply(proc.data, FUN=nrow)))
     
     if(nrow(unique(cbind(data.low[,key])))!=nrow(data.low)) {
-      message(paste(ct, " resolveable duplicates merged into matching records\n", length(which(data$duplicateRecordQF==1)), 
+      message(paste(dupdiff, " resolveable duplicates merged into matching records\n", length(which(data$duplicateRecordQF==1)), 
           " resolved records flagged with duplicateRecordQF=1", sep=""))
     }
     
@@ -248,7 +236,7 @@ removeDups <- function(data, variables, table=NA_character_) {
     
     if(length(which(data$duplicateRecordQF==-1))>0) {
       message(paste(length(which(data$duplicateRecordQF==-1)), 
-          " records could not be evaluated due to missing primary key values and are flagged with duplicateRecordQF=-1", sep=""))
+          " records could not be evaluated and are flagged with duplicateRecordQF=-1", sep=""))
     }
     
   }

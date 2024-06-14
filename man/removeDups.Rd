@@ -4,7 +4,7 @@
 \alias{removeDups}
 \title{Remove duplicates from a data table based on a provided primary key; flag duplicates that can't be removed.}
 \usage{
-removeDups(data, variables, table = NA_character_)
+removeDups(data, variables, table = NA_character_, ncores = 1)
 }
 \arguments{
 \item{data}{A data frame containing data from a NEON observational data table [data frame]}
@@ -12,6 +12,8 @@ removeDups(data, variables, table = NA_character_)
 \item{variables}{The NEON variables file containing metadata about the data table in question [data frame]}
 
 \item{table}{The name of the table. Must match one of the table names in 'variables' [character]}
+
+\item{ncores}{The maximum number of cores to use for parallel processing. Defaults to 1. [numeric]}
 }
 \value{
 A modified data frame with resolveable duplicates removed and a flag field added and populated.
@@ -20,7 +22,7 @@ A modified data frame with resolveable duplicates removed and a flag field added
 NEON observational data may contain duplicates; this function removes exact duplicates, attempts to resolve non-exact duplicates, and flags duplicates that can't be resolved.
 }
 \details{
-Duplicates are identified based on exact matches in the values of the primary key. For records with identical keys, these steps are followed, in order: (1) If records are identical except for NA or empty string values, the non-empty values are kept. (2) If records are identical except for uid, remarks, and/or personnel (xxxxBy) fields, unique values are concatenated within each field, and the merged version is kept. (3) For records that are identical following steps 1 and 2, one record is kept and flagged with duplicateRecordQF=1. (4) Records that can't be resolved by steps 1-3 are flagged with duplicateRecordQF=2. Note that in a set of three or more duplicates, some records may be resolveable and some may not; if two or more records are left after steps 1-3, all remaining records are flagged with duplicateRecordQF=2.
+Duplicates are identified based on exact matches in the values of the primary key. For records with identical keys, these steps are followed, in order: (1) If records are identical except for NA or empty string values, the non-empty values are kept. (2) If records are identical except for uid, remarks, and/or personnel (xxxxBy) fields, unique values are concatenated within each field, and the merged version is kept. (3) For records that are identical following steps 1 and 2, one record is kept and flagged with duplicateRecordQF=1. (4) Records that can't be resolved by steps 1-3 are flagged with duplicateRecordQF=2. Note that in a set of three or more duplicates, some records may be resolveable and some may not; if two or more records are left after steps 1-3, all remaining records are flagged with duplicateRecordQF=2. In some limited cases, duplicates can't be unambiguously identified, and these records are flagged with duplicateRecordQF=-1.
 }
 \examples{
 # Resolve and flag duplicates in a test dataset of foliar lignin
